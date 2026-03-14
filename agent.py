@@ -1,40 +1,62 @@
-from shopify_api import ShopifyAPI
-from cj_api import CJAPI
+from flask import Flask, request, jsonify
+import requests
+import hashlib
+import time
 import config
 
-class ZeroClawAgent:
-    def __init__(self):
-        # 初始化Shopify和CJ的API客户端
-        self.shopify = ShopifyAPI(
-            store_url=config.SHOPIFY_STORE_URL,
-            api_key=config.SHOPIFY_API_KEY,
-            password=config.SHOPIFY_PASSWORD
-        )
-        self.cj = CJAPI(
-            affiliate_id=config.CJ_AFFILIATE_ID,
-            api_key=config.CJ_API_KEY
-        )
+app = Flask(__name__)
 
-    def sync_products_from_cj_to_shopify(self):
-        """从CJ同步产品到Shopify"""
-        print("开始从CJ同步产品...")
-        cj_products = self.cj.get_products()
-        for product in cj_products:
-            self.shopify.create_or_update_product(product)
-        print("产品同步完成。")
+def cj_create_order(shopify_order):
+    """将 Shopify 订单自动同步到 CJ Dropshipping 发货"""
+    timestamp = str(int(time.time()))
+    sign_str = f"{config.CJ_API_KEY}{timestamp}{config.CJ_SECRET_KEY}"
+    sign = hashlib.md5(sign_str.encode()).hexdigest().upper()
 
-    def process_new_shopify_orders(self):
-        """处理Shopify的新订单，自动在CJ下单"""
-        print("开始处理新订单...")
-        shopify_orders = self.shopify.get_new_orders()
-        for order in shopify_orders:
-            cj_order_id = self.cj.place_order(order)
-            self.shopify.update_order_note(order['id'], f"CJ订单ID: {cj_order_id}")
-        print("订单处理完成。")
+    order_data = {
+        "store_id": config.CJ_STORE_ID,
+        "order_id": str(shopify_order["id"]),
+        "recipient_name": shopify_order["shipping_address"]["name"],
+        "recipient_phone": shopify_order["shipping_address"].get("phone", ""),
+        "recipient_email": shopify_order["email"],
+        "recipient_country": shopify_order["shipping_address"]["country"],
+        "recipient_state": shopify_order["shipping_address"]["province"],
+        "recipient_city": shopify_order["shipping_address"]["city"],
+        "recipient_address1": shopify_order["shipping_address"]["address1"],
+        "recipient_address2": shopify_order["shipping_address"].get("address2", ""),
+        "recipient_zip": shopify_order["shipping_address"]["zip"],
+        "items": [
+            {
+                "sku": item["sku"],
+                "quantity": item["quantity"],
+                "price": item["price"]
+            } for item in shopify_order["line_items"]
+        ]
+    }
 
-if __name__ == "__main__":
-    agent = ZeroClawAgent()
-    # 先同步产品
-    agent.sync_products_from_cj_to_shopify()
-    # 再处理订单
-    agent.process_new_shopify_orders()
+    url = "https://developers.cjdropshipping.com/api/v2/orders"
+    headers = {
+        "Content-Type": "application/json",
+        "CJ-Api-Key": config.CJ_API_KEY,
+        "CJ-Timestamp": timestamp,
+        "CJ-Sign": sign
+    }
+
+    response = requests.post(url, json=order_data, headers=headers)
+    return response.json()
+
+@app.route('/webhook/shopify/orders', methods=['POST'])
+def handle_shopify_order():
+    """处理 Shopify 订单创建 Webhook"""
+    order = request.get_json()
+    print(f"✅ 收到新订单 - ID: {order['id']}")
+    print(f"💰 订单金额: ${order['total_price']}")
+    print(f"📧 客户邮箱: {order['email']}")
+
+    # 自动同步到 CJ 发货
+    cj_response = cj_create_order(order)
+    print(f"📦 CJ 发货响应: {cj_response}")
+
+    return jsonify({"status": "success"}), 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
